@@ -216,11 +216,11 @@ def render_message_with_mermaid(content, key_suffix=""):
 
     for i, part in enumerate(parts):
         part = part.strip()
-        
+
         if part.lower().startswith("```mermaid"):
             # Extract mermaid code by removing fences
             mermaid_code = part.removeprefix("```mermaid").removesuffix("```").strip()
-            
+
             if mermaid_code:
                 try:
                     st_mermaid(mermaid_code, height=500)
