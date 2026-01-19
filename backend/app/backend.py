@@ -392,60 +392,90 @@ async def stream_ask_question(request: QueryRequest) -> StreamingResponse:
 
         try:
             # Pass both session_id and topic to the chain
-            async for chunk in graph_rag_chain.astream(
+            async for event in graph_rag_chain.astream_events(
                 {
                     "question": request.question,
                     "chat_history": formatted_history,
                     "session_topic": session_topic,
                     "session_id": request.session_id,
                 },
+                version="v2",
             ):
-                # Extract content and reasoning
-                content_chunk = (
-                    chunk.content if hasattr(chunk, "content") else str(chunk)
-                )
-                reasoning_chunk = (
-                    chunk.additional_kwargs.get("reasoning_content", "")
-                    if hasattr(chunk, "additional_kwargs")
-                    else ""
-                )
+                event_type = event["event"]
+                event_name = event["name"]
 
-                # FIX: Avoid O(n²) string concatenation - collect in list
-                response_chunks.append(content_chunk)
-                thought_chunks.append(reasoning_chunk)
+                # --- Status Updates ---
+                if event_type == "on_chain_start":
+                    if event_name == "GraphTraversal":
+                        yield f"data: {json.dumps({'type': 'status', 'stage': 'graph_traversal', 'status': 'running', 'message': '🕷️ Traversing Knowledge Graph...'})}\n\n"
+                    elif event_name == "Reranking":
+                        yield f"data: {json.dumps({'type': 'status', 'stage': 'reranking', 'status': 'running', 'message': '⚖️ Reranking Documents...'})}\n\n"
 
-                # Create a dictionary for this stream chunk
-                event_data = {
-                    "content": content_chunk,
-                    "reasoning_content": reasoning_chunk,
-                }
+                elif event_type == "on_chain_end":
+                    if event_name == "GraphTraversal":
+                        output = event["data"].get("output", [])
+                        count = len(output) if isinstance(output, list) else 0
+                        yield f"data: {json.dumps({'type': 'status', 'stage': 'graph_traversal', 'status': 'complete', 'message': f'✅ Found {count} documents', 'count': count})}\n\n"
+                    elif event_name == "Reranking":
+                        output = event["data"].get("output", [])
+                        count = len(output) if isinstance(output, list) else 0
+                        yield f"data: {json.dumps({'type': 'status', 'stage': 'reranking', 'status': 'complete', 'message': f'✅ Top {count} documents selected', 'count': count})}\n\n"
 
-                # Format as an SSE data payload
-                yield f"data: {json.dumps(event_data)}\n\n"
+                elif event_type == "on_chat_model_start":
+                    yield f"data: {json.dumps({'type': 'status', 'stage': 'thinking', 'status': 'running', 'message': '🤔 Thinking...'})}\n\n"
+
+                # --- Token Streaming ---
+                elif event_type == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+
+                    # Extract content and reasoning
+                    content_chunk = (
+                        chunk.content if hasattr(chunk, "content") else str(chunk)
+                    )
+                    reasoning_chunk = (
+                        chunk.additional_kwargs.get("reasoning_content", "")
+                        if hasattr(chunk, "additional_kwargs")
+                        else ""
+                    )
+
+                    # Accumulate for DB save
+                    response_chunks.append(content_chunk)
+                    thought_chunks.append(reasoning_chunk)
+
+                    # Create a dictionary for this stream chunk
+                    event_data = {
+                        "type": "token",
+                        "content": content_chunk,
+                        "reasoning_content": reasoning_chunk,
+                    }
+
+                    # Format as an SSE data payload
+                    yield f"data: {json.dumps(event_data)}\n\n"
 
         except Exception as e:
             logger.error(f"Error during streaming: {e}")
             error_event = {
+                "type": "error",
                 "content": f"[Error processing response: {str(e)}]",
                 "reasoning_content": "",
             }
             yield f"data: {json.dumps(error_event)}\n\n"
-            raise
+            # Don't raise here to allow DB save of partial response if any
 
         # Save AI response
         try:
             full_response = "".join(response_chunks)
             full_thought = "".join(thought_chunks)
-            await asyncio.to_thread(
-                add_ai_message_to_session,
-                request.session_id,
-                full_response,
-                full_thought,
-            )
-            logger.info(f"Response saved to DB: {len(full_response)} chars")
-        except Exception as e:
-            logger.warning(f"Error saving AI response: {e}")
-            logger.info(f"Response saved to DB: {len(full_response)} chars")
+
+            # Only save if we got something
+            if full_response or full_thought:
+                await asyncio.to_thread(
+                    add_ai_message_to_session,
+                    request.session_id,
+                    full_response,
+                    full_thought,
+                )
+                logger.info(f"Response saved to DB: {len(full_response)} chars")
         except Exception as e:
             logger.warning(f"Error saving AI response: {e}")
 
