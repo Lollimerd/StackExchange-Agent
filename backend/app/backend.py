@@ -17,7 +17,7 @@ from setup.init import (
     EMBEDDINGS,
     graph,
 )
-from tools.custom_tool import graph_rag_chain
+from tools.custom_tool import graph_rag_tool
 from utils.memory import (
     get_chat_history,
     get_user_sessions,
@@ -392,7 +392,7 @@ async def stream_ask_question(request: QueryRequest) -> StreamingResponse:
 
         try:
             # Pass both session_id and topic to the chain
-            async for event in graph_rag_chain.astream_events(
+            async for event in graph_rag_tool.astream_events(
                 {
                     "question": request.question,
                     "chat_history": formatted_history,

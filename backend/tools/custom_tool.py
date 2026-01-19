@@ -7,14 +7,16 @@ from setup.init import (
 )
 
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
-from langchain_classic.retrievers.contextual_compression import (
-    ContextualCompressionRetriever,
-)
-from langchain_classic.retrievers.document_compressors.cross_encoder_rerank import (
-    CrossEncoderReranker,
-)
+from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
 from langchain_core.runnables import RunnableLambda
-from typing import List, Dict
+from langchain_core.tools import BaseTool
+from pydantic import BaseModel, Field
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForToolRun,
+    CallbackManagerForToolRun,
+)
+from typing import List, Dict, Optional, Type
 from langchain_core.documents import Document
 from prompts.st_overflow import analyst_prompt
 from langchain_core.runnables import RunnablePassthrough
@@ -324,3 +326,66 @@ try:
 except Exception as e:
     logger.error(f"Error initializing GraphRAG chain: {e}")
     raise
+
+
+class GraphRAGInput(BaseModel):
+    """Input for the GraphRAG tool."""
+
+    question: str = Field(description="The question to ask the knowledge base")
+    chat_history: List[Dict] = Field(
+        description="Previous chat history context", default=[]
+    )
+    session_topic: str = Field(
+        description="Current session topic for continuity", default=""
+    )
+    session_id: str = Field(description="Unique session identifier", default="")
+
+
+class GraphRAGTool(BaseTool):
+    """Tool that queries the GraphRAG knowledge base."""
+
+    name: str = "graph_rag_tool"
+    description: str = "Retrieves information from the graph database to answer questions with topic continuity analysis."
+    args_schema: Type[BaseModel] = GraphRAGInput
+
+    def _run(
+        self,
+        question: str,
+        chat_history: List[Dict] = [],
+        session_topic: str = "",
+        session_id: str = "",
+        run_manager: Optional[CallbackManagerForToolRun] = None,
+    ) -> str:
+        """Execute the tool synchronously."""
+        return graph_rag_chain.invoke(
+            {
+                "question": question,
+                "chat_history": chat_history,
+                "session_topic": session_topic,
+                "session_id": session_id,
+            },
+            config={"callbacks": run_manager.get_child() if run_manager else None},
+        )
+
+    async def _arun(
+        self,
+        question: str,
+        chat_history: List[Dict] = [],
+        session_topic: str = "",
+        session_id: str = "",
+        run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
+    ) -> str:
+        """Execute the tool asynchronously."""
+        return await graph_rag_chain.ainvoke(
+            {
+                "question": question,
+                "chat_history": chat_history,
+                "session_topic": session_topic,
+                "session_id": session_id,
+            },
+            config={"callbacks": run_manager.get_child() if run_manager else None},
+        )
+
+
+# Initialize the tool
+graph_rag_tool = GraphRAGTool()
