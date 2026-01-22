@@ -6,9 +6,9 @@ from setup.init import (
     RERANKER_MODEL,
 )
 
-from langchain.retrievers import EnsembleRetriever
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
+from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
+from langchain_classic.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
