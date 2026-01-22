@@ -9,4 +9,4 @@ router_chain = (
     | router_prompt
     | ANSWER_LLM
     | StrOutputParser()
-)
+).with_config(tags=["router"])

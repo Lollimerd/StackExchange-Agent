@@ -452,6 +452,11 @@ async def stream_ask_question(request: QueryRequest) -> StreamingResponse:
             ):
                 event_type = event["event"]
                 event_name = event["name"]
+                event_tags = event.get("tags", [])
+
+                # Filter out router chain events
+                if "router" in event_tags:
+                    continue
 
                 # --- Status Updates ---
                 if event_type == "on_chain_start":
