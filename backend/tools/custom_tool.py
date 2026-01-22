@@ -6,9 +6,9 @@ from setup.init import (
     RERANKER_MODEL,
 )
 
-from langchain_classic.retrievers.ensemble import EnsembleRetriever
-from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
-from langchain_classic.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
+from langchain.retrievers import EnsembleRetriever
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CrossEncoderReranker
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
@@ -22,6 +22,8 @@ from prompts.st_overflow import analyst_prompt
 from langchain_core.runnables import RunnablePassthrough
 from utils.util import format_docs_with_metadata, escape_lucene_chars
 import logging
+from langchain_core.runnables import RunnableBranch
+from tools.router import router_chain
 
 logger = logging.getLogger(__name__)
 
@@ -174,14 +176,14 @@ def retrieve_raw_docs(question: str) -> List[Document]:
     try:
         # Define the common search arguments once
         common_search_kwargs = {
-            "k": 20,
+            "k": 20,             # Increased initial pool: wider net across all entity types
+            "score_threshold": 0.8, # Slightly lowered to ensure we catch cross-domain links
+            "fetch_k": 100,       # Number of candidates for the initial vector search
+            "lambda_mult": 0.5,   # Balanced weight between Vector and Full-text
             "params": {
                 "embedding": EMBEDDINGS.embed_query(question),
                 "keyword_query": escape_lucene_chars(question),
             },
-            "fetch_k": 100,
-            "score_threshold": 0.95,
-            "lambda_mult": 0.5,
         }
 
         # Use a list of vectorstores
@@ -201,7 +203,7 @@ def retrieve_raw_docs(question: str) -> List[Document]:
             retrievers=retrievers,
         )
 
-        logger.info("Executing Graph Traversal & Retrieval...")
+        logger.info(f"--- 🌐 GLOBAL RETRIEVAL: {question} ---")
         docs = ensemble_retriever.invoke(question)
         logger.info(f"Graph Traversal Complete. Found {len(docs)} documents.")
         return docs
@@ -216,13 +218,27 @@ def rerank_docs(inputs: Dict) -> List[Document]:
         docs = inputs.get("docs", [])
         question = inputs.get("question", "")
 
+        RELEVANCY_THRESHOLD = 0.95
+
         if not docs:
             return []
 
         logger.info(f"Reranking {len(docs)} documents...")
-        reranked = compressor.compress_documents(documents=docs, query=question)
-        logger.info(f"Reranking Complete. Kept {len(reranked)} documents.")
-        return reranked
+        reranked_docs = compressor.compress_documents(documents=docs, query=question)
+        
+        # ✨ RELEVANCE GUARDRAIL: Filter by score
+        high_quality_docs = [
+            doc for doc in reranked_docs 
+            if doc.metadata.get("relevance_score", 1.0) >= RELEVANCY_THRESHOLD
+        ]
+        
+        # Handle Low-Confidence Situations
+        if not high_quality_docs:
+            logger.warning(f"⚠️ GUARDRAIL TRIGGERED: No docs met threshold {RELEVANCY_THRESHOLD}")
+            return [] # Returns empty context to trigger LLM fallback
+
+        logger.info(f"✅ {len(high_quality_docs)} docs passed relevancy guardrail.")
+        return high_quality_docs
     except Exception as e:
         logger.error(f"Error in rerank_docs: {e}")
         return []
@@ -248,6 +264,16 @@ def format_chat_history(chat_history: List[Dict[str, str]]) -> str:
     except Exception as e:
         logger.error(f"Error formatting chat history: {e}")
         return ""
+
+
+def check_context_presence(input_dict: Dict) -> Dict:
+    """Adds a system flag if the guardrail blocked all documents."""
+    context = input_dict.get("context", "")
+    # Check if our specific content delimiter is present
+    if not context or "--------- CONTENT ---------" not in context:
+        input_dict["context"] = "[SYSTEM NOTE: NO RELEVANT DATA FOUND IN KNOWLEDGE GRAPH]"
+        logger.info("Context fallback applied: No relevant data found.")
+    return input_dict
 
 
 def process_with_topic_analysis(input_dict: Dict) -> Dict:
@@ -302,27 +328,42 @@ def process_with_topic_analysis(input_dict: Dict) -> Dict:
         }
 
 
+# ===========================================================================================================================================================
+# Router Chain -- Imported from tools.router
+# ===========================================================================================================================================================
+
+
 retrieval_chain = RunnablePassthrough.assign(
     docs=lambda x: RunnableLambda(retrieve_raw_docs)
     .with_config(run_name="GraphTraversal")
     .invoke(x["question"])
 ) | RunnableLambda(rerank_docs).with_config(run_name="Reranking")
 
+
+def route_decision(info):
+    if "retrieval_needed" in info["router_decision"].lower():
+        return retrieval_chain | format_docs_with_metadata
+    else:
+        return lambda x: []  # Return empty docs for conversational
+
+
 # This chain is activated for GraphRAG.
 try:
     graph_rag_chain = (
         RunnablePassthrough.assign(
-            context=retrieval_chain | format_docs_with_metadata,
-            chat_history_formatted=lambda x: format_chat_history(
-                x.get("chat_history", [])
-            ),
+            router_decision=router_chain,
+            chat_history_formatted=lambda x: format_chat_history(x.get("chat_history", [])),
         )
         # Fix: Run topic analysis ONCE and merge results
         | process_with_topic_analysis
+        | RunnablePassthrough.assign(
+            context=route_decision
+        )
+        | check_context_presence # NEW: Guardrail handler
         | analyst_prompt
         | ANSWER_LLM
     )
-    logger.info("GraphRAG chain with topic analysis initialized successfully")
+    logger.info("GraphRAG chain with topic analysis and router initialized successfully")
 except Exception as e:
     logger.error(f"Error initializing GraphRAG chain: {e}")
     raise
