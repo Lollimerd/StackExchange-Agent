@@ -9,3 +9,4 @@ plotly
 pandas
 python-dotenv
 pyvis
+langchain_neo4j
