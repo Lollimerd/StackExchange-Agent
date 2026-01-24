@@ -7,23 +7,23 @@ from setup.init import (
 )
 
 from langchain_classic.retrievers.ensemble import EnsembleRetriever
-from langchain_classic.retrievers.contextual_compression import ContextualCompressionRetriever
-from langchain_classic.retrievers.document_compressors.cross_encoder_rerank import CrossEncoderReranker
-from langchain_core.runnables import RunnableLambda
-from langchain_core.tools import BaseTool
-from pydantic import BaseModel, Field
-from langchain_core.callbacks import (
-    AsyncCallbackManagerForToolRun,
-    CallbackManagerForToolRun,
+
+from langchain_classic.retrievers.document_compressors.cross_encoder_rerank import (
+    CrossEncoderReranker,
 )
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from typing import List, Dict, Optional, Type
 from langchain_core.documents import Document
 from prompts.st_overflow import analyst_prompt
-from langchain_core.runnables import RunnablePassthrough
 from utils.util import format_docs_with_metadata, escape_lucene_chars
+from langchain_core.tools import BaseTool
+from langchain_core.callbacks import (
+    CallbackManagerForToolRun,
+    AsyncCallbackManagerForToolRun,
+)
+from pydantic import BaseModel, Field
 import logging
-from langchain_core.runnables import RunnableBranch
-from tools.router import router_chain
+
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ RETURN
   } AS metadata,
   score
 ORDER BY score DESC
-LIMIT 50
+LIMIT 20
 """
 
 # Create vector stores with error handling
@@ -176,18 +176,26 @@ def retrieve_raw_docs(question: str) -> List[Document]:
     try:
         # Define the common search arguments once
         common_search_kwargs = {
-            "k": 20,             # Increased initial pool: wider net across all entity types
-            "score_threshold": 0.8, # Slightly lowered to ensure we catch cross-domain links
-            "fetch_k": 100,       # Number of candidates for the initial vector search
-            "lambda_mult": 0.5,   # Balanced weight between Vector and Full-text
+            "k": 20,  # Increased initial pool: wider net across all entity types
+            "score_threshold": 0.9,  # Slightly lowered to ensure we catch cross-domain links
+            "fetch_k": 100,  # Number of candidates for the initial vector search
+            "lambda_mult": 0.5,  # Balanced weight between Vector and Full-text
             "params": {
                 "embedding": EMBEDDINGS.embed_query(question),
                 "keyword_query": escape_lucene_chars(question),
             },
         }
 
-        # Use a list of vectorstores
-        vectorstores = [tagstore, userstore, questionstore, answerstore]
+        # Use a list of vectorstores, filtering out any that failed to initialize
+        vectorstores = [
+            s
+            for s in [tagstore, userstore, questionstore, answerstore]
+            if s is not None
+        ]
+
+        if not vectorstores:
+            logger.warning("No vector stores available for retrieval")
+            return []
 
         # Create the retrievers using a list comprehension
         retrievers = [
@@ -198,9 +206,14 @@ def retrieve_raw_docs(question: str) -> List[Document]:
             for store in vectorstores
         ]
 
+        # Calculate equal weights dynamically
+        num_retrievers = len(retrievers)
+        weights = [1.0 / num_retrievers] * num_retrievers
+
         # init ensemble retriever
         ensemble_retriever = EnsembleRetriever(
             retrievers=retrievers,
+            weights=weights,
         )
 
         logger.info(f"--- 🌐 GLOBAL RETRIEVAL: {question} ---")
@@ -225,17 +238,20 @@ def rerank_docs(inputs: Dict) -> List[Document]:
 
         logger.info(f"Reranking {len(docs)} documents...")
         reranked_docs = compressor.compress_documents(documents=docs, query=question)
-        
+
         # ✨ RELEVANCE GUARDRAIL: Filter by score
         high_quality_docs = [
-            doc for doc in reranked_docs 
+            doc
+            for doc in reranked_docs
             if doc.metadata.get("relevance_score", 1.0) >= RELEVANCY_THRESHOLD
         ]
-        
+
         # Handle Low-Confidence Situations
         if not high_quality_docs:
-            logger.warning(f"⚠️ GUARDRAIL TRIGGERED: No docs met threshold {RELEVANCY_THRESHOLD}")
-            return [] # Returns empty context to trigger LLM fallback
+            logger.warning(
+                f"⚠️ GUARDRAIL TRIGGERED: No docs met threshold {RELEVANCY_THRESHOLD}"
+            )
+            return []  # Returns empty context to trigger LLM fallback
 
         logger.info(f"✅ {len(high_quality_docs)} docs passed relevancy guardrail.")
         return high_quality_docs
@@ -271,7 +287,9 @@ def check_context_presence(input_dict: Dict) -> Dict:
     context = input_dict.get("context", "")
     # Check if our specific content delimiter is present
     if not context or "--------- CONTENT ---------" not in context:
-        input_dict["context"] = "[SYSTEM NOTE: NO RELEVANT DATA FOUND IN KNOWLEDGE GRAPH]"
+        input_dict["context"] = (
+            "[SYSTEM NOTE: NO RELEVANT DATA FOUND IN KNOWLEDGE GRAPH]"
+        )
         logger.info("Context fallback applied: No relevant data found.")
     return input_dict
 
@@ -328,42 +346,27 @@ def process_with_topic_analysis(input_dict: Dict) -> Dict:
         }
 
 
-# ===========================================================================================================================================================
-# Router Chain -- Imported from tools.router
-# ===========================================================================================================================================================
-
-
 retrieval_chain = RunnablePassthrough.assign(
     docs=lambda x: RunnableLambda(retrieve_raw_docs)
     .with_config(run_name="GraphTraversal")
     .invoke(x["question"])
 ) | RunnableLambda(rerank_docs).with_config(run_name="Reranking")
 
-
-def route_decision(info):
-    if "retrieval_needed" in info["router_decision"].lower():
-        return retrieval_chain | format_docs_with_metadata
-    else:
-        return lambda x: []  # Return empty docs for conversational
-
-
 # This chain is activated for GraphRAG.
 try:
     graph_rag_chain = (
         RunnablePassthrough.assign(
-            router_decision=router_chain,
-            chat_history_formatted=lambda x: format_chat_history(x.get("chat_history", [])),
+            context=retrieval_chain | format_docs_with_metadata,
+            chat_history_formatted=lambda x: format_chat_history(
+                x.get("chat_history", [])
+            ),
         )
         # Fix: Run topic analysis ONCE and merge results
         | process_with_topic_analysis
-        | RunnablePassthrough.assign(
-            context=route_decision
-        )
-        | check_context_presence # NEW: Guardrail handler
         | analyst_prompt
         | ANSWER_LLM
     )
-    logger.info("GraphRAG chain with topic analysis and router initialized successfully")
+    logger.info("GraphRAG chain with topic analysis initialized successfully")
 except Exception as e:
     logger.error(f"Error initializing GraphRAG chain: {e}")
     raise
@@ -398,7 +401,7 @@ class GraphRAGTool(BaseTool):
         run_manager: Optional[CallbackManagerForToolRun] = None,
     ) -> str:
         """Execute the tool synchronously."""
-        return graph_rag_chain.invoke(
+        result = graph_rag_chain.invoke(
             {
                 "question": question,
                 "chat_history": chat_history,
@@ -407,6 +410,7 @@ class GraphRAGTool(BaseTool):
             },
             config={"callbacks": run_manager.get_child() if run_manager else None},
         )
+        return str(result.content)
 
     async def _arun(
         self,
@@ -417,7 +421,7 @@ class GraphRAGTool(BaseTool):
         run_manager: Optional[AsyncCallbackManagerForToolRun] = None,
     ) -> str:
         """Execute the tool asynchronously."""
-        return await graph_rag_chain.ainvoke(
+        result = await graph_rag_chain.ainvoke(
             {
                 "question": question,
                 "chat_history": chat_history,
@@ -426,6 +430,7 @@ class GraphRAGTool(BaseTool):
             },
             config={"callbacks": run_manager.get_child() if run_manager else None},
         )
+        return str(result.content)
 
 
 # Initialize the tool
