@@ -1,34 +1,42 @@
 # main.py
-import asyncio, os, json, uvicorn, logging, uuid, time
+import asyncio
 from datetime import datetime
-from typing import AsyncGenerator, List, Dict
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import json
+import logging
+import os
+import time
+from typing import AsyncGenerator, Dict, List
 from urllib.parse import urlparse
+import uuid
+
 from dotenv import load_dotenv
-from utils.util import find_container_by_port
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import uvicorn
+
 from setup.init import (
     ANSWER_LLM,
+    EMBEDDINGS,
+    NEO4J_PASSWORD,
     NEO4J_URL,
     NEO4J_USERNAME,
-    NEO4J_PASSWORD,
-    EMBEDDINGS,
     graph,
 )
 from tools.custom_tool import graph_rag_tool
 from utils.memory import (
+    add_ai_message_to_session,
+    add_user_message_to_session,
+    delete_session,
+    delete_user,
+    get_all_users,
     get_chat_history,
     get_user_sessions,
     link_session_to_user,
-    get_all_users,
-    delete_session,
-    delete_user,
-    add_user_message_to_session,
-    add_ai_message_to_session,
 )
 from utils.topic_manager import TopicManager
+from utils.util import find_container_by_port
 
 # Load environment variables
 load_dotenv()
@@ -89,7 +97,7 @@ def get_configuration():
     """Provides frontend with configuration details for display."""
     try:
         parsed_url = urlparse(NEO4J_URL)
-        neo4j_port = parsed_url.port
+        neo4j_port = parsed_url.port or 7687
         neo4j_host = parsed_url.hostname
         discovered_name = find_container_by_port(neo4j_port)
 
@@ -378,7 +386,7 @@ async def stream_ask_question(request: QueryRequest) -> StreamingResponse:
             topic = request.question if is_first_message else None
 
             await asyncio.to_thread(
-                link_session_to_user, request.session_id, request.user_id, topic
+                link_session_to_user, request.session_id, request.user_id, topic or ""
             )
 
             # Get chat history and current topic
@@ -452,18 +460,31 @@ async def stream_ask_question(request: QueryRequest) -> StreamingResponse:
             ):
                 event_type = event["event"]
                 event_name = event["name"]
-                event_tags = event.get("tags", [])
-
-                # Filter out router chain events
-                if "router" in event_tags:
-                    continue
 
                 # --- Status Updates ---
                 if event_type == "on_chain_start":
                     if event_name == "GraphTraversal":
-                        yield f"data: {json.dumps({'type': 'status', 'stage': 'graph_traversal', 'status': 'running', 'message': '🕷️ Traversing Knowledge Graph...'})}\n\n"
+                        yield f"data: {
+                            json.dumps(
+                                {
+                                    'type': 'status',
+                                    'stage': 'graph_traversal',
+                                    'status': 'running',
+                                    'message': '🕷️ Traversing Knowledge Graph...',
+                                }
+                            )
+                        }\n\n"
                     elif event_name == "Reranking":
-                        yield f"data: {json.dumps({'type': 'status', 'stage': 'reranking', 'status': 'running', 'message': '⚖️ Reranking Documents...'})}\n\n"
+                        yield f"data: {
+                            json.dumps(
+                                {
+                                    'type': 'status',
+                                    'stage': 'reranking',
+                                    'status': 'running',
+                                    'message': '⚖️ Reranking Documents...',
+                                }
+                            )
+                        }\n\n"
 
                 elif event_type == "on_chain_end":
                     if event_name == "GraphTraversal":
@@ -480,7 +501,9 @@ async def stream_ask_question(request: QueryRequest) -> StreamingResponse:
 
                 # --- Token Streaming ---
                 elif event_type == "on_chat_model_stream":
-                    chunk = event["data"]["chunk"]
+                    chunk = event["data"].get("chunk")
+                    if not chunk:
+                        continue
 
                     # Extract content and reasoning
                     content_chunk = (
